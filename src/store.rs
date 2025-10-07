@@ -5,9 +5,10 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 pub struct CaCache {
-    repo: Repository,
+    repo: Arc<Mutex<Repository>>,
 }
 
 impl CaCache {
@@ -17,7 +18,9 @@ impl CaCache {
         } else {
             Repository::init(path_to_repo)?
         };
-        Ok(Self { repo })
+        Ok(Self {
+            repo: Arc::new(Mutex::new(repo)),
+        })
     }
 
     pub fn add(&self, path: &Path) -> Result<(String, Oid), git2::Error> {
@@ -40,7 +43,7 @@ impl CaCache {
             return Ok((file_hash, entry));
         }
 
-        let blob_oid = self.repo.blob(&buffer)?;
+        let blob_oid = self.repo.lock().unwrap().blob(&buffer)?;
 
         self.update_tree_and_commit(&file_hash, blob_oid, FileMode::Blob)?;
 
@@ -67,13 +70,14 @@ impl CaCache {
         let t = self.last_tree().unwrap();
         let tree_entry = t.get_name(key).unwrap();
         let filemode = tree_entry.filemode();
-        let object = tree_entry.to_object(&self.repo).unwrap();
-        let nar_encoder = NarTreeEncoder::new(&self.repo, &object, filemode);
+        let object = tree_entry.to_object(&self.repo.lock().unwrap()).unwrap();
+        let nar_encoder = NarTreeEncoder::new(&self.repo.lock().unwrap(), &object, filemode);
         nar_encoder.encode()
     }
 
     fn create_tree_from_dir(&self, path: &Path) -> Result<Oid, git2::Error> {
-        let mut builder = self.repo.treebuilder(None)?;
+        let repo = self.repo.lock().unwrap();
+        let mut builder = repo.treebuilder(None)?;
 
         for entry in path.read_dir().expect("Failed to read directory") {
             let entry = entry.expect("Failed to get directory entry");
@@ -85,7 +89,7 @@ impl CaCache {
                 .unwrap();
 
             if entry_path.is_file() {
-                let blob_oid = self.repo.blob_path(&entry_path)?;
+                let blob_oid = self.repo.lock().unwrap().blob_path(&entry_path)?;
                 builder.insert(entry_file_name, blob_oid, FileMode::Blob.into())?;
             } else if entry_path.is_dir() {
                 let subtree_oid = self.create_tree_from_dir(&entry_path)?;
@@ -101,14 +105,15 @@ impl CaCache {
         oid: Oid,
         mode: FileMode,
     ) -> Result<Oid, git2::Error> {
-        let parent_commit = self.repo.head().ok().and_then(|r| r.peel_to_commit().ok());
+        let repo = self.repo.lock().unwrap();
+        let parent_commit = repo.head().ok().and_then(|r| r.peel_to_commit().ok());
         let last_tree = parent_commit.as_ref().and_then(|commit| commit.tree().ok());
 
-        let mut tree_builder = self.repo.treebuilder(last_tree.as_ref())?;
+        let mut tree_builder = repo.treebuilder(last_tree.as_ref())?;
 
         tree_builder.insert(name, oid, mode.into())?;
         let tree_oid = tree_builder.write()?;
-        let new_tree = self.repo.find_tree(tree_oid)?;
+        let new_tree = repo.find_tree(tree_oid)?;
 
         let parents: Vec<&Commit> = parent_commit.as_ref().into_iter().collect();
 
@@ -120,8 +125,8 @@ impl CaCache {
     fn commit(&self, tree: &Tree, parents: &[&Commit]) -> Result<Oid, git2::Error> {
         // TODO: optimize by using once_cell
         let sig = Signature::new("gachix", "gachix@gachix.com", &Time::new(0, 0))?;
-        self.repo
-            .commit(Some("HEAD"), &sig, &sig, "", &tree, parents)
+        let repo = self.repo.lock().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "", &tree, parents)
     }
 
     pub fn query(&self, key: &str) -> Option<Oid> {
@@ -135,8 +140,8 @@ impl CaCache {
     }
 
     fn last_tree(&self) -> Option<Tree<'_>> {
-        self.repo
-            .head()
+        let repo = self.repo.lock().unwrap();
+        repo.head()
             .ok()
             .and_then(|r| r.peel_to_commit().ok().and_then(|c| c.tree().ok()))
     }
