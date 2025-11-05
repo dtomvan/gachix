@@ -14,8 +14,27 @@ use crate::nix_interface::path::NixPath;
 pub trait AsyncStream: AsyncWriteExt + AsyncReadExt + Unpin + Unpin + Send {}
 impl<T> AsyncStream for T where T: AsyncWriteExt + AsyncReadExt + AsyncWrite + Unpin + Send {}
 
+#[derive(Debug)]
 pub struct NixDaemon<C: AsyncStream> {
     store: DaemonStore<C>,
+}
+
+pub async fn get_pathinfo(path: &NixPath) -> Result<Option<PathInfo>> {
+    let mut store = DaemonStore::builder()
+        .connect_unix("/nix/var/nix/daemon-socket/socket")
+        .await?;
+    Ok(store.query_pathinfo(path).result().await?)
+}
+pub async fn path_exists(path: &NixPath) -> Result<bool> {
+    let mut store = DaemonStore::builder()
+        .connect_unix("/nix/var/nix/daemon-socket/socket")
+        .await?;
+    Ok(store.is_valid_path(path).result().await?)
+}
+
+pub fn fetch(store_path: &NixPath) -> Result<impl Read> {
+    let enc = Encoder::new(&store_path)?;
+    Ok(enc)
 }
 
 impl NixDaemon<UnixStream> {

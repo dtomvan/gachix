@@ -1,13 +1,15 @@
+use crate::git_store::GitRepo;
 use crate::nar::NarGitStream;
+use crate::nix_interface::daemon;
 use crate::nix_interface::daemon::AsyncStream;
 use crate::nix_interface::daemon::NixDaemon;
 use crate::nix_interface::nar_info::NarInfo;
 use crate::nix_interface::path::NixPath;
 use anyhow::{anyhow, bail};
+use futures::future::join_all;
 use git2::Oid;
+use std::sync::Arc;
 use tracing::{debug, info, trace};
-
-use crate::git_store::GitRepo;
 
 use anyhow::Result;
 const PACKGAGE_PREFIX_REF: &str = "refs/packages";
@@ -33,7 +35,11 @@ impl Store {
         Ok(())
     }
 
-    pub async fn _add_closure(&self, store_path: &NixPath, count: usize) -> Result<(Oid, usize)> {
+    pub async fn _add_closure(
+        self: &Arc<Self>,
+        store_path: &NixPath,
+        count: usize,
+    ) -> Result<(Oid, usize)> {
         if count == 100 {
             bail!("Dependency Depth Limit exceeded");
         }
@@ -42,18 +48,34 @@ impl Store {
             return Ok((commit_oid, 0));
         }
 
-        let mut nix = NixDaemon::local().await?;
-        let (narinfo, tree_oid) = self.try_add_package(&mut nix, store_path).await?;
-        drop(nix);
+        let (narinfo, tree_oid) = self.try_add_package(store_path).await?;
 
         let deps = narinfo.get_dependencies();
         let mut parent_commits = Vec::new();
         let mut total_packages_added = 0;
-        for dependency in deps {
-            let (dep_coid, num_packages_added) =
-                Box::pin(self._add_closure(&dependency, count + 1)).await?;
-            total_packages_added += num_packages_added;
-            parent_commits.push(dep_coid);
+        let tasks = deps
+            .into_iter()
+            .map(|dependency| {
+                let self_clone = Arc::clone(&self);
+                let dep_clone = dependency.clone();
+
+                tokio::spawn(async move { self_clone._add_closure(&dep_clone, count + 1).await })
+            })
+            .collect::<Vec<_>>(); //
+
+        let results = join_all(tasks).await;
+
+        for result in results {
+            match result {
+                Ok(task_result) => {
+                    let (dep_coid, num_packages_added) = task_result?;
+                    total_packages_added += num_packages_added;
+                    parent_commits.push(dep_coid);
+                }
+                Err(join_err) => {
+                    bail!("A dependency task failed to execute: {}", join_err);
+                }
+            }
         }
         let commit_oid =
             self.repo
@@ -74,39 +96,28 @@ impl Store {
         res
     }
 
-    async fn try_add_package(
-        &self,
-        nix: &mut NixDaemon<impl AsyncStream>,
-        store_path: &NixPath,
-    ) -> Result<(NarInfo, Oid)> {
+    async fn try_add_package(&self, store_path: &NixPath) -> Result<(NarInfo, Oid)> {
         info!("Adding package: {}", store_path.get_name());
-        let path_exists = nix.path_exists(&store_path).await?;
+        let path_exists = daemon::path_exists(store_path).await?;
         if !path_exists {
             // TODO: try to build package if it does not exist
             return Err(anyhow!("Path does not exist {}", store_path));
         }
 
         trace!("Fetching package content");
-        let reader = nix.fetch(store_path)?;
+        let reader = daemon::fetch(store_path)?;
 
         trace!("Adding package content to repository");
         let (entry_oid, _) = self.repo.add_nar(reader)?;
 
         trace!("Adding narinfo entry");
-        let narinfo = self
-            .add_narinfo(nix, &entry_oid.to_string(), store_path)
-            .await?;
+        let narinfo = self.add_narinfo(&entry_oid.to_string(), store_path).await?;
 
         Ok((narinfo, entry_oid))
     }
 
-    async fn add_narinfo(
-        &self,
-        nix: &mut NixDaemon<impl AsyncStream>,
-        package_key: &str,
-        store_path: &NixPath,
-    ) -> Result<NarInfo> {
-        let Some(path_info) = nix.get_pathinfo(&store_path).await? else {
+    async fn add_narinfo(&self, package_key: &str, store_path: &NixPath) -> Result<NarInfo> {
+        let Some(path_info) = daemon::get_pathinfo(&store_path).await? else {
             return Err(anyhow!(
                 "Could not find narinfo for {}",
                 store_path.get_path()
