@@ -87,13 +87,14 @@ impl Store {
         let package_id = package_path.get_base_32_hash();
 
         let narinfo_ref = self.get_narinfo_ref(package_id);
+        let pkg_ref = self.get_result_ref(package_id);
 
         if self.repo.reference_exists(&narinfo_ref)? {
             debug!("Package already exists");
             return Ok(());
         }
 
-        let Ok(Some((_, narinfo_blob_oid, _))) =
+        let Ok(Some((_, narinfo_blob_oid, package_tree_oid))) =
             self.get_package_from_nix_daemons(package_path).await
         else {
             bail!(
@@ -101,6 +102,7 @@ impl Store {
                 package_path
             );
         };
+        self.repo.add_ref(&pkg_ref, package_tree_oid)?;
         self.repo.add_ref(&narinfo_ref, narinfo_blob_oid)?;
         Ok(())
     }
