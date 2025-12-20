@@ -1,0 +1,19 @@
+name: gachix-compose
+services:
+  ubuntu-node:
+    image: gachix-ubuntu
+    build:
+      context: ../
+      dockerfile: docker/ubuntu/Dockerfile
+    networks:
+      - gachix-net
+  nix-node:
+    image: gachix-nix
+    build:
+      context: ../
+      dockerfile: docker/nix/Dockerfile
+    networks:
+      - gachix-net
+networks:
+  gachix-net:
+    driver: bridge
